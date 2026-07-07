@@ -49,4 +49,5 @@ sequenceDiagram
 
 - If multiple software modules run on the same server or physical device, group them in a Mermaid `box`
 - Use `Note right of Participant: ...` or `Note over A,B: ...` for assumptions, invariants, constraints, or non-obvious context.
+- Do not use semicolons inside Mermaid elements. Mermaid treats `;` as a line terminator, so it will break the diagram.
 - Use `autonumber` when text will reference a specific message; omit it otherwise.
