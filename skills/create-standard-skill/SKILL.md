@@ -9,7 +9,7 @@ disable-model-invocation: true
 ## Instructions
 
 When this skill is invoked, follow the active skill-creation guidance as the source of truth, with these constraints:
-- Use the standard skill folder : `.agent/skills/` instead of agent specific ones (ex: subfolders of .cursor, .codex, ...)
+- Use the standard skill folder : `.agents/skills/` instead of agent specific ones (ex: subfolders of .cursor, .codex, ...)
 
 ## Reference
 
