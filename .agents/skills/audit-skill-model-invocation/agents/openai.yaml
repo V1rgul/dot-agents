@@ -1,0 +1,7 @@
+interface:
+  display_name: "Audit Skill Invocability"
+  short_description: "Classify skill model invocability"
+  default_prompt: "Use $audit-skill-model-invocation to classify these skills as model-invocable or non-model-invocable."
+
+policy:
+  allow_implicit_invocation: false
