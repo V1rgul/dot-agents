@@ -1,7 +1,7 @@
 interface:
-  display_name: "Thread Token Count"
-  short_description: "Count Codex and Cursor thread tokens"
-  default_prompt: "Use $tokens-count to report token usage for selected Codex and Cursor threads."
+  display_name: "Codex Usage Count"
+  short_description: "Count Codex tokens, turns, requests, and tools"
+  default_prompt: "Use $tokens-count to report tokens, turns, requests, tool calls, and threads for selected Codex tasks."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false
