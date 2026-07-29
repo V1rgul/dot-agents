@@ -39,6 +39,13 @@ class CursorUsageTests(unittest.TestCase):
 	def tearDown(self):
 		self.temporary_directory.cleanup()
 
+	def default_time_window(self):
+		return patch.object(
+			COUNT_TOKENS,
+			'today_window',
+			return_value=(datetime(2026, 7, 28, tzinfo=timezone.utc), datetime(2026, 7, 29, tzinfo=timezone.utc)),
+		)
+
 	def test_cursor_counts_available_activity_and_filters_by_time(self):
 		diagnostics = {}
 		connection = COUNT_TOKENS.connect_cursor_db(self.database_path)
@@ -85,9 +92,13 @@ class CursorUsageTests(unittest.TestCase):
 		self.assertEqual(total['tokens'], {'input': {'total': 30, 'cache_read': 8, 'cache_write': 0, 'uncached': 22}, 'output': {'total': 10, 'reasoning': 3}, 'total': 40})
 		self.assertNotIn('derived_tokens', total)
 
+	def test_uncached_excludes_cache_reads_and_writes(self):
+		counts = COUNT_TOKENS.input_counts({'input_tokens': 10, 'cached_input_tokens': 3, 'cache_write_input_tokens': 2})
+		self.assertEqual(counts, {'total': 10, 'cache_read': 3, 'cache_write': 2, 'uncached': 5})
+
 	def test_cursor_all_through_cli_interface(self):
 		output = io.StringIO()
-		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--json', '--detail']), redirect_stdout(output):
+		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--json', '--detail']), redirect_stdout(output):
 			exit_code = COUNT_TOKENS.main()
 		result = json.loads(output.getvalue())
 		self.assertEqual(exit_code, 0)
@@ -96,6 +107,7 @@ class CursorUsageTests(unittest.TestCase):
 		self.assertEqual(result['threads'][0]['thread_id'], 'CaseSensitive-ID')
 		self.assertNotIn('thread', result['threads'][0])
 		self.assertNotIn('thread_count', result['threads'][0])
+		self.assertNotIn('help', result)
 		self.assertNotIn('request_count', result['threads'][0])
 		self.assertNotIn('tokens', result['threads'][0])
 		self.assertNotIn('null', json.dumps(result['threads'][0]))
@@ -109,7 +121,7 @@ class CursorUsageTests(unittest.TestCase):
 
 	def test_default_output_is_toon_total_only(self):
 		output = io.StringIO()
-		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all']), redirect_stdout(output):
+		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all']), redirect_stdout(output):
 			exit_code = COUNT_TOKENS.main()
 		self.assertEqual(exit_code, 0)
 		self.assertEqual(output.getvalue(), '\n'.join([
@@ -127,25 +139,34 @@ class CursorUsageTests(unittest.TestCase):
 			'    total: 0',
 			'    reasoning: 0',
 			'  total: 0',
+			'help[1]: Add `--after <datetime>` and/or `--before <datetime>` to select another time range',
 		]))
 
 	def test_json_without_detail_returns_total_directly(self):
 		output = io.StringIO()
-		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--json']), redirect_stdout(output):
+		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--json']), redirect_stdout(output):
 			exit_code = COUNT_TOKENS.main()
 		result = json.loads(output.getvalue())
 		self.assertEqual(exit_code, 0)
 		self.assertEqual(result['thread_count'], 1)
 		self.assertNotIn('threads', result)
 		self.assertNotIn('total', result)
+		self.assertNotIn('help', result)
 
 	def test_detail_toon_flattens_threads_and_uses_empty_cells(self):
 		output = io.StringIO()
-		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--detail']), redirect_stdout(output):
+		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--detail']), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main()
+		self.assertEqual(exit_code, 0)
+		self.assertTrue(output.getvalue().startswith('threads[1]{provider,thread_id,thread_name,tokens}:\n  cursor,CaseSensitive-ID,Cursor thread,\ntotal:\n'))
+		self.assertFalse(output.getvalue().endswith('\n'))
+
+	def test_detail_fields_all_returns_full_toon_schema(self):
+		output = io.StringIO()
+		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--detail', '--fields', 'all']), redirect_stdout(output):
 			exit_code = COUNT_TOKENS.main()
 		self.assertEqual(exit_code, 0)
 		self.assertTrue(output.getvalue().startswith('threads[1]{provider,thread_id,thread_name,turn_count,request_count,tool_call_count,start,end,input,cache_read,cache_write,uncached,output,reasoning,tokens}:\n  cursor,CaseSensitive-ID,Cursor thread,1,,2,,,,,,,,,\ntotal:\n'))
-		self.assertFalse(output.getvalue().endswith('\n'))
 
 	def test_detail_toon_tabularizes_mixed_thread_schemas(self):
 		event_time = datetime(2026, 7, 28, tzinfo=timezone.utc)
@@ -158,6 +179,102 @@ class CursorUsageTests(unittest.TestCase):
 		self.assertEqual(lines[1], '  codex,codex-id,,1,1,1,"2026-07-28T00:00:00Z","2026-07-28T00:00:00Z",1,1,,0,1,1,1')
 		self.assertEqual(lines[2], '  cursor,cursor-id,Cursor,2,,3,,,,,,,,,')
 		self.assertNotIn(COUNT_TOKENS.TOON_MISSING, output)
+
+	def test_json_fields_projects_nested_tokens(self):
+		output = io.StringIO()
+		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--detail', '--fields', 'provider,thread_id,tool_call_count', '--json']), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main()
+		result = json.loads(output.getvalue())
+		self.assertEqual(exit_code, 0)
+		self.assertEqual(result['threads'], [{'provider': 'cursor', 'thread_id': 'CaseSensitive-ID', 'tool_call_count': 2}])
+		self.assertNotIn('help', result)
+
+	def test_no_args_is_live_home_view(self):
+		output = io.StringIO()
+		with patch.object(COUNT_TOKENS, 'collect_results', return_value=[]), patch.object(COUNT_TOKENS, 'today_window', return_value=(datetime(2026, 7, 29, tzinfo=timezone.utc), datetime(2026, 7, 30, tzinfo=timezone.utc))), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main([])
+		self.assertEqual(exit_code, 0)
+		self.assertIn('bin:', output.getvalue())
+		self.assertIn("today's activity is the default", output.getvalue())
+		self.assertIn('thread_count: 0', output.getvalue())
+		self.assertIn('help[3]:', output.getvalue())
+		self.assertIn('--after <datetime>', output.getvalue())
+		self.assertIn('--before <datetime>', output.getvalue())
+
+	def test_detailed_home_does_not_recommend_detail(self):
+		output = io.StringIO()
+		with patch.object(COUNT_TOKENS, 'collect_results', return_value=[]), patch.object(COUNT_TOKENS, 'today_window', return_value=(datetime(2026, 7, 29, tzinfo=timezone.utc), datetime(2026, 7, 30, tzinfo=timezone.utc))), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['--detail'])
+		self.assertEqual(exit_code, 0)
+		self.assertNotIn('--detail', output.getvalue())
+		self.assertIn('<provider>:<thread_id> <provider>:<thread_id>', output.getvalue())
+		self.assertIn('activity counts, start/end timestamps', output.getvalue())
+		self.assertIn('input, cache, output, reasoning, and total token counts', output.getvalue())
+		self.assertIn('--fields all', output.getvalue())
+		self.assertIn('--after <datetime>', output.getvalue())
+
+	def test_home_with_time_filter_does_not_suggest_time_flags(self):
+		output = io.StringIO()
+		after = datetime(2026, 7, 29, tzinfo=timezone.utc)
+		with patch.object(COUNT_TOKENS, 'collect_results', return_value=[]), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['--after', after.isoformat()])
+		self.assertEqual(exit_code, 0)
+		self.assertNotIn('Add `--after', output.getvalue())
+
+	def test_json_home_omits_suggestions(self):
+		output = io.StringIO()
+		with patch.object(COUNT_TOKENS, 'collect_results', return_value=[]), patch.object(COUNT_TOKENS, 'today_window', return_value=(datetime(2026, 7, 29, tzinfo=timezone.utc), datetime(2026, 7, 30, tzinfo=timezone.utc))), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['--json'])
+		result = json.loads(output.getvalue())
+		self.assertEqual(exit_code, 0)
+		self.assertNotIn('help', result)
+
+	def test_detail_help_explains_every_field(self):
+		output = io.StringIO()
+		with redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['--detail', '--help'])
+		self.assertEqual(exit_code, 0)
+		for field in COUNT_TOKENS.DETAIL_FIELDS:
+			self.assertIn(f'  {field}', output.getvalue())
+			self.assertIn(COUNT_TOKENS.DETAIL_FIELD_DESCRIPTIONS[field], output.getvalue())
+			self.assertTrue(COUNT_TOKENS.DETAIL_FIELD_DESCRIPTIONS[field].endswith(('Providers: Codex.', 'Providers: Codex, Cursor.')))
+		self.assertIn('Default fields: provider, thread_id, thread_name, tokens', output.getvalue())
+		self.assertIn('Unavailable values are blank in TOON and omitted from JSON.', output.getvalue())
+		self.assertIn('max(0, input - cache_read - cache_write)', output.getvalue())
+		self.assertIn('reported directly rather than computed from input and output', output.getvalue())
+		self.assertNotIn('usage:', output.getvalue())
+		self.assertNotIn('Examples:', output.getvalue())
+
+	def test_global_help_references_detail_help(self):
+		output = io.StringIO()
+		with redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['--help'])
+		self.assertEqual(exit_code, 0)
+		self.assertIn('see --detail --help', output.getvalue())
+
+	def test_usage_errors_are_structured_on_stdout(self):
+		output = io.StringIO()
+		with redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['cursor:all', '--fields', 'tokens'])
+		self.assertEqual(exit_code, 2)
+		self.assertEqual(output.getvalue().splitlines()[0], 'error: "--fields requires --detail"')
+		self.assertIn('help:', output.getvalue())
+
+	def test_removed_thread_flag_has_targeted_hint(self):
+		output = io.StringIO()
+		with redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['--thread', 'abc'])
+		self.assertEqual(exit_code, 2)
+		self.assertIn('error: "--thread was removed"', output.getvalue())
+		self.assertIn('pass codex:<thread_id> or cursor:<thread_id> positionally', output.getvalue())
+
+	def test_unknown_flag_lists_valid_flags(self):
+		output = io.StringIO()
+		with redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main(['cursor:all', '--stat'])
+		self.assertEqual(exit_code, 2)
+		self.assertIn('error: "unrecognized arguments: --stat"', output.getvalue())
+		self.assertIn('valid flags:', output.getvalue())
 
 class SelectorTests(unittest.TestCase):
 	def test_all_is_provider_qualified(self):

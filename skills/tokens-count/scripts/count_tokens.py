@@ -8,10 +8,10 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any
-from toon_format import encode as encode_toon
+
 STANDARD_FIELDS = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens')
 READ_FIELDS = ('cache_read_input_tokens', 'cached_input_tokens')
 WRITE_FIELDS = ('cache_write_input_tokens', 'cache_creation_input_tokens', 'cache_write_tokens', 'cache_creation_tokens')
@@ -19,9 +19,52 @@ PROVIDERS = ('codex', 'cursor')
 CURSOR_HUMAN_BUBBLE_TYPE = 1
 THREAD_ID_RE = re.compile('([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\.jsonl$', re.IGNORECASE)
 TOON_MISSING = '__TOKENS_COUNT_MISSING_8F0B3C57__'
+DESCRIPTION = "Count Codex tokens and Codex/Cursor activity from local data; today's activity is the default."
+DETAIL_FIELDS = (
+	'provider',
+	'thread_id',
+	'thread_name',
+	'turn_count',
+	'request_count',
+	'tool_call_count',
+	'start',
+	'end',
+	'input',
+	'cache_read',
+	'cache_write',
+	'uncached',
+	'output',
+	'reasoning',
+	'tokens',
+)
+DEFAULT_DETAIL_FIELDS = ('provider', 'thread_id', 'thread_name', 'tokens')
+DETAIL_FIELD_DESCRIPTIONS = {
+	'provider': 'Data source for the row. Providers: Codex, Cursor.',
+	'thread_id': 'Provider-local thread identifier. Providers: Codex, Cursor.',
+	'thread_name': 'Thread title when recorded locally. Providers: Codex, Cursor.',
+	'turn_count': 'Number of user turns. Providers: Codex, Cursor.',
+	'request_count': 'Number of model requests with recorded token usage. Providers: Codex.',
+	'tool_call_count': 'Number of unique tool calls. Providers: Codex, Cursor.',
+	'start': 'Timestamp of the first request with recorded token usage in the selected range. Providers: Codex.',
+	'end': 'Timestamp of the last request with recorded token usage in the selected range. Providers: Codex.',
+	'input': 'Total input tokens, including tokens read from or written to cache. Providers: Codex.',
+	'cache_read': 'Input tokens read from cache. Providers: Codex.',
+	'cache_write': 'Input tokens written to cache. Providers: Codex.',
+	'uncached': 'Input tokens neither read from nor written to cache; computed as max(0, input - cache_read - cache_write). Providers: Codex.',
+	'output': 'Total output tokens, including reasoning. Providers: Codex.',
+	'reasoning': 'Output tokens used for reasoning; included in output. Providers: Codex.',
+	'tokens': 'Total input and output tokens; reported directly rather than computed from input and output. Providers: Codex.',
+}
 
 class CountError(Exception):
 	pass
+
+class UsageError(Exception):
+	pass
+
+class AxiArgumentParser(argparse.ArgumentParser):
+	def error(self, message: str) -> None:
+		raise UsageError(message)
 
 def parse_datetime(value: str) -> datetime:
 	text = value.strip()
@@ -341,7 +384,7 @@ def input_counts(raw: dict[str, int | None]) -> dict[str, int | None]:
 	input_tokens = raw.get('input_tokens')
 	uncached = None
 	if isinstance(input_tokens, int) and isinstance(cache_read, int):
-		uncached = max(0, input_tokens - cache_read)
+		uncached = max(0, input_tokens - cache_read - (cache_write if isinstance(cache_write, int) else 0))
 	return {'total': input_tokens, 'cache_read': cache_read, 'cache_write': cache_write, 'uncached': uncached}
 
 def make_tokens(raw: dict[str, int | None]) -> dict[str, Any]:
@@ -404,8 +447,8 @@ def nested_value(value: dict[str, Any], *path: str) -> Any:
 		current = current[field]
 	return current
 
-def flatten_thread_for_toon(thread: dict[str, Any]) -> dict[str, Any]:
-	return {
+def flatten_thread_for_toon(thread: dict[str, Any], fields: tuple[str, ...] = DETAIL_FIELDS) -> dict[str, Any]:
+	values = {
 		'provider': nested_value(thread, 'provider'),
 		'thread_id': nested_value(thread, 'thread_id'),
 		'thread_name': nested_value(thread, 'thread_name'),
@@ -422,52 +465,138 @@ def flatten_thread_for_toon(thread: dict[str, Any]) -> dict[str, Any]:
 		'reasoning': nested_value(thread, 'tokens', 'output', 'reasoning'),
 		'tokens': nested_value(thread, 'tokens', 'total'),
 	}
+	return {field: values[field] for field in fields}
 
-def encode_output_as_toon(output: dict[str, Any]) -> str:
+def project_thread_for_json(thread: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+	projected: dict[str, Any] = {}
+	for field in fields:
+		if field in ('provider', 'thread_id', 'thread_name', 'turn_count', 'request_count', 'tool_call_count', 'start', 'end'):
+			if field in thread:
+				projected[field] = thread[field]
+			continue
+		token_path = {
+			'input': ('input', 'total'),
+			'cache_read': ('input', 'cache_read'),
+			'cache_write': ('input', 'cache_write'),
+			'uncached': ('input', 'uncached'),
+			'output': ('output', 'total'),
+			'reasoning': ('output', 'reasoning'),
+			'tokens': ('total',),
+		}[field]
+		value = nested_value(thread, 'tokens', *token_path)
+		if value == TOON_MISSING:
+			continue
+		tokens = projected.setdefault('tokens', {})
+		if len(token_path) == 1:
+			tokens[token_path[0]] = value
+		else:
+			tokens.setdefault(token_path[0], {})[token_path[1]] = value
+	return projected
+
+def encode_output_as_toon(output: dict[str, Any], fields: tuple[str, ...] = DETAIL_FIELDS) -> str:
+	try:
+		from toon_format import encode as encode_toon
+	except ImportError as exc:
+		raise CountError('TOON output support is not installed') from exc
 	toon_output = output
 	if isinstance(output.get('threads'), list):
-		toon_output = {**output, 'threads': [flatten_thread_for_toon(thread) for thread in output['threads']]}
+		toon_output = {**output, 'threads': [flatten_thread_for_toon(thread, fields) for thread in output['threads']]}
 	return encode_toon(toon_output).replace(TOON_MISSING, '')
 
+def parse_fields(raw: str | None) -> tuple[str, ...]:
+	if raw is None:
+		return DEFAULT_DETAIL_FIELDS
+	if raw.strip().casefold() == 'all':
+		return DETAIL_FIELDS
+	fields = tuple(dict.fromkeys(field.strip() for field in raw.split(',') if field.strip()))
+	if not fields:
+		raise UsageError('--fields requires a comma-separated field list or all')
+	unknown = [field for field in fields if field not in DETAIL_FIELDS]
+	if unknown:
+		raise UsageError(f"unknown detail field(s): {', '.join(unknown)}")
+	return fields
+
 def build_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(description='Count locally recorded Codex and Cursor usage per thread.')
-	parser.add_argument('threads', nargs='+', metavar='PROVIDER:THREAD_ID', help='Codex or Cursor thread selector by full ID, unique prefix, or provider:all')
+	parser = AxiArgumentParser(
+		description=DESCRIPTION,
+		formatter_class=argparse.RawDescriptionHelpFormatter,
+		epilog='\n'.join((
+			'Examples:',
+			'  count_tokens.py',
+			'  count_tokens.py codex:all cursor:all --after 2026-07-28T00:00:00Z',
+			'  count_tokens.py codex:<thread_id> --detail --fields all --json',
+		)),
+	)
+	parser.add_argument('threads', nargs='*', metavar='PROVIDER:THREAD_ID', help='full ID, unique prefix, or provider:all; defaults to codex:all cursor:all for today')
 	parser.add_argument('--after', type=parse_datetime, metavar='DATETIME', help='include events at or after this ISO 8601 datetime')
 	parser.add_argument('--before', type=parse_datetime, metavar='DATETIME', help='include events before this ISO 8601 datetime')
-	parser.add_argument('--detail', action='store_true', help='include the per-thread array with the total')
+	parser.add_argument('--detail', action='store_true', help='include a minimal per-thread array and the full total; see --detail --help')
+	parser.add_argument('--fields', metavar='LIST', help='comma-separated thread fields, or all; requires --detail')
 	parser.add_argument('--json', action='store_true', help='encode output as JSON instead of TOON')
 	return parser
 
-def main() -> int:
-	parser = build_parser()
-	args = parser.parse_args()
-	if args.after is not None and args.before is not None and (args.after >= args.before):
-		parser.error('--after must be earlier than --before')
-	diagnostics: dict[str, int] = defaultdict(int)
+def format_detail_help() -> str:
+	width = max(len(field) for field in DETAIL_FIELDS)
+	lines = [
+		'Detail fields:',
+		*(f'  {field.ljust(width)}  {DETAIL_FIELD_DESCRIPTIONS[field]}' for field in DETAIL_FIELDS),
+		'',
+		f'Default fields: {", ".join(DEFAULT_DETAIL_FIELDS)}',
+		'Unavailable values are blank in TOON and omitted from JSON.',
+		'',
+	]
+	return '\n'.join(lines)
+
+def collapsed_script_path() -> str:
+	script = Path(__file__).resolve()
+	home = Path.home().resolve()
+	try:
+		return str(Path('~') / script.relative_to(home))
+	except ValueError:
+		return str(script)
+
+def command_prefix() -> str:
+	path = collapsed_script_path()
+	return f'python "{path}"' if ' ' in path else f'python {path}'
+
+def today_window() -> tuple[datetime, datetime]:
+	now = datetime.now().astimezone()
+	start = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
+	return (start.astimezone(timezone.utc), now.astimezone(timezone.utc))
+
+def requested_threads(selectors: list[str]) -> dict[str, list[str]]:
 	requested_by_provider: dict[str, list[str]] = defaultdict(list)
-	try:
-		for raw in args.threads:
-			provider, thread_id = parse_selector(raw)
-			requested_by_provider[provider].append(thread_id)
-		for provider, requested_threads in requested_by_provider.items():
-			if any((thread_id.casefold() == 'all' for thread_id in requested_threads)) and len(requested_threads) != 1:
-				raise CountError(f'cannot combine {provider}:all with specific {provider} thread selectors')
-	except CountError as exc:
-		parser.error(str(exc))
+	for raw in selectors:
+		provider, thread_id = parse_selector(raw)
+		requested_by_provider[provider].append(thread_id)
+	for provider, provider_threads in requested_by_provider.items():
+		if any(thread_id.casefold() == 'all' for thread_id in provider_threads) and len(provider_threads) != 1:
+			raise UsageError(f'cannot combine {provider}:all with specific {provider} thread selectors')
+	return requested_by_provider
+
+def collect_results(
+	requested_by_provider: dict[str, list[str]],
+	after: datetime | None,
+	before: datetime | None,
+	*,
+	best_effort: bool = False,
+	failures: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+	diagnostics: dict[str, int] = defaultdict(int)
 	results: list[dict[str, Any]] = []
-	try:
-		for provider, requested_threads in requested_by_provider.items():
-			select_all = requested_threads[0].casefold() == 'all'
+	for provider, provider_threads in requested_by_provider.items():
+		select_all = provider_threads[0].casefold() == 'all'
+		try:
 			if provider == 'codex':
 				codex_home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')).expanduser()
 				codex_threads = discover_codex_threads(codex_home, diagnostics)
 				if not codex_threads:
 					raise CountError(f'no Codex session JSONL files found under {codex_home}')
 				codex_names = load_codex_names(codex_home, diagnostics)
-				selected = sorted(codex_threads) if select_all else resolve_threads(provider, requested_threads, set(codex_threads))
+				selected = sorted(codex_threads) if select_all else resolve_threads(provider, provider_threads, set(codex_threads))
 				provider_results: list[dict[str, Any]] = []
 				for thread_id in selected:
-					raw, request_count, turn_count, tool_call_count, first_event, last_event = parse_codex_usage(codex_threads[thread_id], args.after, args.before, diagnostics)
+					raw, request_count, turn_count, tool_call_count, first_event, last_event = parse_codex_usage(codex_threads[thread_id], after, before, diagnostics)
 					if select_all and request_count == 0:
 						continue
 					provider_results.append(make_result(provider, thread_id, codex_names.get(thread_id), raw, first_event, last_event, turn_count=turn_count, request_count=request_count, tool_call_count=tool_call_count))
@@ -481,10 +610,10 @@ def main() -> int:
 				cursor_threads = discover_cursor_threads(connection, diagnostics)
 				if not cursor_threads:
 					raise CountError(f'no Cursor threads found in {cursor_db_path}')
-				selected = sorted(cursor_threads, key=str.casefold) if select_all else resolve_threads(provider, requested_threads, set(cursor_threads))
+				selected = sorted(cursor_threads, key=str.casefold) if select_all else resolve_threads(provider, provider_threads, set(cursor_threads))
 				provider_results = []
 				for thread_id in selected:
-					turn_count, tool_call_count, activity_count = parse_cursor_usage(connection, thread_id, args.after, args.before, diagnostics)
+					turn_count, tool_call_count, activity_count = parse_cursor_usage(connection, thread_id, after, before, diagnostics)
 					if select_all and activity_count == 0:
 						continue
 					provider_results.append(make_result(provider, thread_id, cursor_threads.get(thread_id), empty_unknown_counts(), None, None, turn_count=turn_count, request_count=None, tool_call_count=tool_call_count))
@@ -493,12 +622,119 @@ def main() -> int:
 				results.extend(provider_results)
 			finally:
 				connection.close()
+		except CountError as exc:
+			if not best_effort:
+				raise
+			if failures is not None:
+				failures.append({'provider': provider, 'error': str(exc)})
+	return results
+
+def detailed_help() -> list[str]:
+	prefix = command_prefix()
+	return [
+		f'Run `{prefix} <provider>:<thread_id> <provider>:<thread_id>` for a total across selected threads',
+		'Add `--fields all` for activity counts, start/end timestamps, and input, cache, output, reasoning, and total token counts',
+	]
+
+def time_range_help() -> str:
+	return 'Add `--after <datetime>` and/or `--before <datetime>` to select another time range'
+
+def home_output(results: list[dict[str, Any]], detail: bool, fields: tuple[str, ...], json_mode: bool, failures: list[dict[str, str]], suggest_time_range: bool) -> dict[str, Any]:
+	prefix = command_prefix()
+	output: dict[str, Any] = {
+		'bin': collapsed_script_path(),
+		'description': DESCRIPTION,
+	}
+	if detail:
+		output['threads'] = [project_thread_for_json(thread, fields) for thread in results] if json_mode else results
+	output['total'] = total_results(results)
+	if failures:
+		output['unavailable'] = failures
+	if not json_mode:
+		if detail:
+			output['help'] = detailed_help()
+		else:
+			output['help'] = [
+				f'Run `{prefix} --detail` for per-thread titles and totals',
+				f'Run `{prefix} codex:<thread_id>` for one Codex thread total',
+			]
+		if suggest_time_range:
+			output['help'].append(time_range_help())
+	return output
+
+def emit_output(output: dict[str, Any], *, json_mode: bool, fields: tuple[str, ...]) -> None:
+	if json_mode:
+		sys.stdout.write(json.dumps(output, indent=2, ensure_ascii=False))
+		return
+	sys.stdout.write(encode_output_as_toon(output, fields))
+
+def emit_error(message: str, help_text: str, *, json_mode: bool) -> None:
+	output = {'error': message, 'help': help_text}
+	if json_mode:
+		sys.stdout.write(json.dumps(output, indent=2, ensure_ascii=False))
+		return
+	try:
+		sys.stdout.write(encode_output_as_toon(output))
+	except CountError:
+		sys.stdout.write(json.dumps(output, ensure_ascii=False))
+
+def valid_flags_help() -> str:
+	return f'Run `{command_prefix()} --help`; valid flags: --after, --before, --detail, --fields, --json, --help'
+
+def main(argv: list[str] | None = None) -> int:
+	arguments = list(sys.argv[1:] if argv is None else argv)
+	json_mode = '--json' in arguments
+	parser = build_parser()
+	if '--help' in arguments or '-h' in arguments:
+		sys.stdout.write(format_detail_help() if '--detail' in arguments else parser.format_help())
+		return 0
+	for removed, replacement in (('--thread-all', 'use codex:all or cursor:all'), ('--thread', 'pass codex:<thread_id> or cursor:<thread_id> positionally')):
+		if any(argument == removed or argument.startswith(f'{removed}=') for argument in arguments):
+			emit_error(f'{removed} was removed', replacement, json_mode=json_mode)
+			return 2
+	try:
+		args = parser.parse_args(arguments)
+		if args.after is not None and args.before is not None and args.after >= args.before:
+			raise UsageError('--after must be earlier than --before')
+		if args.fields is not None and not args.detail:
+			raise UsageError('--fields requires --detail')
+		fields = parse_fields(args.fields)
+		time_range_supplied = args.after is not None or args.before is not None
+		home = not args.threads
+		if not time_range_supplied:
+			args.after, args.before = today_window()
+		if home:
+			selectors = ['codex:all', 'cursor:all']
+		else:
+			selectors = args.threads
+		requested = requested_threads(selectors)
+	except (UsageError, CountError) as exc:
+		emit_error(str(exc), valid_flags_help(), json_mode=json_mode)
+		return 2
+	try:
+		failures: list[dict[str, str]] = []
+		results = collect_results(requested, args.after, args.before, best_effort=home, failures=failures)
+		if home:
+			output = home_output(results, args.detail, fields, args.json, failures, not time_range_supplied)
+		elif args.detail:
+			output = {
+				'threads': [project_thread_for_json(thread, fields) for thread in results] if args.json else results,
+				'total': total_results(results),
+			}
+			if not args.json:
+				output['help'] = detailed_help()
+				if not time_range_supplied:
+					output['help'].append(time_range_help())
+		else:
+			output = total_results(results)
+			if not args.json and not time_range_supplied:
+				output['help'] = [time_range_help()]
+		emit_output(output, json_mode=args.json, fields=fields)
+		return 0
 	except CountError as exc:
-		parser.error(str(exc))
-	total = total_results(results)
-	output = {'threads': results, 'total': total} if args.detail else total
-	encoded = json.dumps(output, indent=2, ensure_ascii=False) if args.json else encode_output_as_toon(output)
-	sys.stdout.write(encoded)
-	return 0
+		help_text = f'Run `{command_prefix()} --json` if TOON output is unavailable' if 'TOON output' in str(exc) else f'Confirm the selected local data exists, then rerun `{command_prefix()} {" ".join(selectors)}`'
+		emit_error(str(exc), help_text, json_mode=args.json)
+		return 1
+
 if __name__ == '__main__':
 	sys.exit(main())
