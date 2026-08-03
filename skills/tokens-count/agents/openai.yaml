@@ -1,7 +1,0 @@
-interface:
-  display_name: "Codex and Cursor Usage Count"
-  short_description: "Count local Codex tokens and Cursor activity"
-  default_prompt: "Use $tokens-count to report local Codex token usage or Cursor thread activity."
-
-policy:
-  allow_implicit_invocation: false

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Local AI Agent Usage Stats"
+  short_description: "Summarize local Codex and Cursor usage"
+  default_prompt: "Use $local-ai-agent-usage-stats to summarize local Codex or Cursor activity and token usage."
+
+policy:
+  allow_implicit_invocation: false

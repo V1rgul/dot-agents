@@ -20,6 +20,7 @@ CURSOR_HUMAN_BUBBLE_TYPE = 1
 THREAD_ID_RE = re.compile('([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\.jsonl$', re.IGNORECASE)
 TOON_MISSING = '__TOKENS_COUNT_MISSING_8F0B3C57__'
 DESCRIPTION = "Count Codex tokens and Codex/Cursor activity from local data; today's activity is the default."
+NO_ACTIVITY_HELP = 'No recorded activity matches the selected time range; adjust `--after` or `--before`'
 DETAIL_FIELDS = (
 	'provider',
 	'thread_id',
@@ -38,12 +39,29 @@ DETAIL_FIELDS = (
 	'reasoning',
 	'tokens',
 )
-DEFAULT_DETAIL_FIELDS = ('provider', 'thread_id', 'thread_name', 'models', 'tokens')
+DEFAULT_DETAIL_FIELDS = ('provider', 'thread_id', 'thread_name', 'tokens')
+DEFAULT_SELECTORS = ('codex:all', 'cursor:all')
+ALL_COLLECTION_FIELDS = frozenset(DETAIL_FIELDS)
+PROVIDER_DETAIL_FIELDS = {
+	'codex': ALL_COLLECTION_FIELDS,
+	'cursor': frozenset(('provider', 'thread_id', 'thread_name', 'turn_count', 'tool_call_count')),
+}
+THREAD_DIRECT_FIELDS = ('provider', 'thread_id', 'thread_name', 'models', 'turn_count', 'request_count', 'tool_call_count', 'start', 'end')
+TOTAL_DIRECT_FIELDS = ('models', 'turn_count', 'request_count', 'tool_call_count', 'start', 'end')
+TOKEN_FIELD_PATHS = {
+	'input': ('input', 'total'),
+	'cache_read': ('input', 'cache_read'),
+	'cache_write': ('input', 'cache_write'),
+	'uncached': ('input', 'uncached'),
+	'output': ('output', 'total'),
+	'reasoning': ('output', 'reasoning'),
+	'tokens': ('total',),
+}
 DETAIL_FIELD_DESCRIPTIONS = {
 	'provider': 'Data source for the row. Providers: Codex, Cursor.',
 	'thread_id': 'Provider-local thread identifier. Providers: Codex, Cursor.',
 	'thread_name': 'Thread title when recorded locally. Providers: Codex, Cursor.',
-	'models': 'Distinct effective models recorded in the selected range. Providers: Codex.',
+	'models': 'Distinct effective model@reasoning-effort configurations recorded in the selected range. Providers: Codex.',
 	'turn_count': 'Number of user turns. Providers: Codex, Cursor.',
 	'request_count': 'Number of model requests with recorded token usage. Providers: Codex.',
 	'tool_call_count': 'Number of unique tool calls. Providers: Codex, Cursor.',
@@ -60,6 +78,11 @@ DETAIL_FIELD_DESCRIPTIONS = {
 
 class CountError(Exception):
 	pass
+
+class ThreadNotFoundError(CountError):
+	def __init__(self, provider: str, thread_id: str):
+		self.provider = provider
+		super().__init__(f'{provider.capitalize()} thread not found: {thread_id}')
 
 class UsageError(Exception):
 	pass
@@ -106,7 +129,7 @@ def resolve_threads(provider: str, requested: list[str], available: set[str]) ->
 		matches = [thread_id for thread_id in available if thread_id.casefold().startswith(value)]
 		exact = next((thread_id for thread_id in matches if thread_id.casefold() == value), None)
 		if not matches:
-			raise CountError(f'{provider_name} thread not found: {raw}')
+			raise ThreadNotFoundError(provider, raw)
 		if exact is not None:
 			match = exact
 		elif len(matches) == 1:
@@ -162,7 +185,7 @@ def thread_id_from_file(path: Path) -> str | None:
 	match = THREAD_ID_RE.search(path.name)
 	return match.group(1).lower() if match else None
 
-def discover_codex_threads(codex_home: Path, diagnostics: dict[str, int]) -> dict[str, list[Path]]:
+def discover_codex_threads(codex_home: Path, diagnostics: dict[str, int], after: datetime | None = None) -> dict[str, list[Path]]:
 	grouped: dict[str, list[Path]] = defaultdict(list)
 	seen_paths: set[Path] = set()
 	for directory in (codex_home / 'sessions', codex_home / 'archived_sessions'):
@@ -173,6 +196,13 @@ def discover_codex_threads(codex_home: Path, diagnostics: dict[str, int]) -> dic
 			if resolved in seen_paths:
 				continue
 			seen_paths.add(resolved)
+			diagnostics['codex_session_files'] += 1
+			if after is not None:
+				try:
+					if path.stat().st_mtime < after.timestamp():
+						continue
+				except OSError:
+					pass
 			thread_id = thread_id_from_file(path)
 			if thread_id is None:
 				diagnostics['codex_files_without_thread_id'] += 1
@@ -236,60 +266,106 @@ def cursor_name_from_value(value: Any, diagnostics: dict[str, int]) -> str | Non
 			return name
 	return None
 
-def discover_cursor_threads(connection: sqlite3.Connection, diagnostics: dict[str, int]) -> dict[str, str | None]:
+def discover_cursor_threads(connection: sqlite3.Connection, diagnostics: dict[str, int], after: datetime | None = None, *, include_names: bool = True) -> dict[str, str | None]:
 	threads: dict[str, str | None] = {}
 	try:
-		for thread_id, value in connection.execute('SELECT composerId, value FROM composerHeaders'):
+		header_columns = 'composerId, value' if include_names else 'composerId'
+		header_where = ''
+		header_parameters: tuple[Any, ...] = ()
+		if after is not None:
+			header_where = ' WHERE lastUpdatedAt IS NULL OR lastUpdatedAt <= 0 OR lastUpdatedAt >= ?'
+			header_parameters = (int(after.timestamp() * 1000),)
+		for row in connection.execute(f'SELECT {header_columns} FROM composerHeaders{header_where}', header_parameters):
+			thread_id = row[0]
 			if not isinstance(thread_id, str) or not thread_id:
 				diagnostics['cursor_headers_without_thread_id'] += 1
 				continue
-			threads[thread_id] = cursor_name_from_value(value, diagnostics)
+			threads[thread_id] = cursor_name_from_value(row[1], diagnostics) if include_names else None
 		prefix = 'composerData:'
-		for key, value in connection.execute('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?', (prefix, 'composerData;')):
+		data_columns = 'key, value' if include_names else 'key'
+		data_where = 'key >= ? AND key < ?'
+		data_parameters: list[Any] = [prefix, 'composerData;']
+		if after is not None:
+			data_where += ' AND NOT EXISTS (SELECT 1 FROM composerHeaders WHERE composerId = substr(cursorDiskKV.key, ?) AND lastUpdatedAt > 0 AND lastUpdatedAt < ?)'
+			data_parameters.extend((len(prefix) + 1, int(after.timestamp() * 1000)))
+		for row in connection.execute(f'SELECT {data_columns} FROM cursorDiskKV WHERE {data_where}', data_parameters):
+			key = row[0]
 			if not isinstance(key, str) or not key.startswith(prefix):
 				continue
 			thread_id = key[len(prefix):]
 			if not thread_id:
 				continue
-			name = cursor_name_from_value(value, diagnostics)
+			name = cursor_name_from_value(row[1], diagnostics) if include_names else None
 			if thread_id not in threads or threads[thread_id] is None:
 				threads[thread_id] = name
 	except sqlite3.Error as exc:
 		raise CountError(f'cannot read Cursor thread metadata: {exc}') from exc
 	return threads
 
-def parse_cursor_usage(connection: sqlite3.Connection, thread_id: str, after: datetime | None, before: datetime | None, diagnostics: dict[str, int]) -> tuple[int, int, int]:
-	turn_count = 0
-	activity_count = 0
-	seen_tool_calls: set[str] = set()
-	prefix = f'bubbleId:{thread_id}:'
+def cursor_threads_exist(connection: sqlite3.Connection) -> bool:
+	prefix = 'composerData:'
 	try:
-		rows = connection.execute('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?', (prefix, f'{prefix}\U0010ffff'))
-		for key, value in rows:
-			try:
-				bubble = json.loads(value)
-			except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-				diagnostics['cursor_malformed_bubble_records'] += 1
-				continue
-			if not isinstance(bubble, dict):
-				diagnostics['cursor_malformed_bubble_records'] += 1
-				continue
-			included, _ = event_in_window({'timestamp': bubble.get('createdAt')}, after, before, diagnostics, 'cursor_bubbles_without_usable_timestamp')
-			if not included:
-				continue
+		if connection.execute('SELECT 1 FROM composerHeaders LIMIT 1').fetchone() is not None:
+			return True
+		return connection.execute('SELECT 1 FROM cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1', (prefix, 'composerData;')).fetchone() is not None
+	except sqlite3.Error as exc:
+		raise CountError(f'cannot read Cursor thread metadata: {exc}') from exc
+
+def parse_cursor_usage(
+	connection: sqlite3.Connection,
+	thread_id: str,
+	after: datetime | None,
+	before: datetime | None,
+	diagnostics: dict[str, int],
+	required_fields: frozenset[str] = ALL_COLLECTION_FIELDS,
+	*,
+	activity_required: bool = True,
+) -> tuple[int, int, int]:
+	need_turns = 'turn_count' in required_fields
+	need_tools = 'tool_call_count' in required_fields
+	if not activity_required and not need_turns and not need_tools:
+		return (0, 0, 0)
+	prefix = f'bubbleId:{thread_id}:'
+	timestamp = "CASE WHEN json_valid(value) THEN json_extract(value, '$.createdAt') END"
+	where = ['key >= ?', 'key < ?', 'json_valid(value)']
+	parameters: list[Any] = [prefix, f'{prefix}\U0010ffff']
+	if after is not None:
+		where.append(f'julianday({timestamp}) >= julianday(?)')
+		parameters.append(utc_text(after))
+	if before is not None:
+		where.append(f'julianday({timestamp}) < julianday(?)')
+		parameters.append(utc_text(before))
+	try:
+		if not need_turns and not need_tools:
+			row = connection.execute(f'SELECT 1 FROM cursorDiskKV WHERE {" AND ".join(where)} LIMIT 1', parameters).fetchone()
+			return (0, 0, 1 if row is not None else 0)
+		columns: list[str] = []
+		if need_turns:
+			columns.append("CASE WHEN json_valid(value) THEN json_extract(value, '$.type') END")
+		if need_tools:
+			columns.extend(('key', "CASE WHEN json_valid(value) THEN json_extract(value, '$.toolFormerData.toolCallId') END", "CASE WHEN json_valid(value) THEN json_type(value, '$.toolFormerData') END"))
+		turn_count = 0
+		activity_count = 0
+		seen_tool_calls: set[str] = set()
+		for row in connection.execute(f'SELECT {", ".join(columns)} FROM cursorDiskKV WHERE {" AND ".join(where)}', parameters):
 			activity_count += 1
-			bubble_type = bubble.get('type')
-			if isinstance(bubble_type, int) and not isinstance(bubble_type, bool) and bubble_type == CURSOR_HUMAN_BUBBLE_TYPE:
-				turn_count += 1
-			tool_data = bubble.get('toolFormerData')
-			if not isinstance(tool_data, dict):
-				continue
-			call_id = tool_data.get('toolCallId')
-			identity = call_id if isinstance(call_id, str) and call_id else key
-			seen_tool_calls.add(identity)
+			column = 0
+			if need_turns:
+				bubble_type = row[column]
+				column += 1
+				if isinstance(bubble_type, int) and not isinstance(bubble_type, bool) and bubble_type == CURSOR_HUMAN_BUBBLE_TYPE:
+					turn_count += 1
+			if need_tools:
+				key, call_id, tool_data_type = row[column], row[column + 1], row[column + 2]
+				if tool_data_type != 'object':
+					continue
+				if isinstance(call_id, str) and call_id:
+					seen_tool_calls.add(call_id)
+				elif isinstance(key, str):
+					seen_tool_calls.add(key)
+		return (turn_count, len(seen_tool_calls), activity_count)
 	except sqlite3.Error as exc:
 		raise CountError(f'cannot read Cursor thread {thread_id}: {exc}') from exc
-	return (turn_count, len(seen_tool_calls), activity_count)
 
 def usage_delta(current: dict[str, int], previous: dict[str, int]) -> dict[str, int]:
 	delta: dict[str, int] = {}
@@ -298,8 +374,28 @@ def usage_delta(current: dict[str, int], previous: dict[str, int]) -> dict[str, 
 		delta[key] = value - prior if value >= prior else value
 	return delta
 
-def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetime | None, diagnostics: dict[str, int]) -> tuple[dict[str, int], int, int, int, datetime | None, datetime | None, list[str]]:
-	totals = empty_codex_counts()
+def parse_codex_usage(
+	paths: list[Path],
+	after: datetime | None,
+	before: datetime | None,
+	diagnostics: dict[str, int],
+	required_fields: frozenset[str] = ALL_COLLECTION_FIELDS,
+	*,
+	activity_required: bool = True,
+) -> tuple[dict[str, int], int, int, int, datetime | None, datetime | None, list[str]]:
+	need_tokens = bool(required_fields.intersection(TOKEN_FIELD_PATHS))
+	need_requests = 'request_count' in required_fields
+	need_turns = 'turn_count' in required_fields
+	need_tools = 'tool_call_count' in required_fields
+	need_times = bool(required_fields.intersection(('start', 'end')))
+	need_models = 'models' in required_fields
+	need_token_events = activity_required or need_tokens or need_requests or need_times or need_models
+	need_turn_context = need_turns or need_models
+	if not need_token_events and not need_turn_context and not need_tools:
+		return ({}, 0, 0, 0, None, None, [])
+	activity_only = activity_required and not (need_tokens or need_requests or need_turns or need_tools or need_times or need_models)
+	markers = tuple(marker for required, marker in ((need_token_events, '"token_count"'), (need_turn_context, '"turn_context"'), (need_tools, '"response_item"')) if required)
+	totals = empty_codex_counts() if need_tokens else {}
 	request_count = 0
 	turn_count = 0
 	tool_call_count = 0
@@ -309,34 +405,40 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 	seen_turns: set[str] = set()
 	seen_tool_calls: set[str] = set()
 	models: set[str] = set()
+	activity_found = False
 	for path in paths:
 		previous_total: dict[str, int] = {}
 		active_model: str | None = None
 		try:
 			with path.open('r', encoding='utf-8') as stream:
 				for line in stream:
+					if not any(marker in line for marker in markers):
+						continue
 					try:
 						event = json.loads(line)
 					except json.JSONDecodeError:
 						diagnostics['codex_malformed_json_lines'] += 1
 						continue
 					payload = event.get('payload')
-					if event.get('type') == 'turn_context' and isinstance(payload, dict):
+					if need_turn_context and event.get('type') == 'turn_context' and isinstance(payload, dict):
 						model = payload.get('model')
 						if isinstance(model, str) and model:
-							active_model = model
+							effort = payload.get('effort')
+							active_model = f'{model}@{effort}' if isinstance(effort, str) and effort else model
 						included, _ = event_in_window(event, after, before, diagnostics, 'codex_turns_without_usable_timestamp')
 						if not included:
 							continue
-						if active_model is not None:
+						if need_models and active_model is not None:
 							models.add(active_model)
+						if not need_turns:
+							continue
 						turn_id = payload.get('turn_id')
 						identity = f'turn:{turn_id}' if isinstance(turn_id, str) and turn_id else json.dumps([event.get('timestamp'), payload], sort_keys=True, separators=(',', ':'))
 						if identity not in seen_turns:
 							seen_turns.add(identity)
 							turn_count += 1
 						continue
-					if event.get('type') == 'response_item' and isinstance(payload, dict):
+					if need_tools and event.get('type') == 'response_item' and isinstance(payload, dict):
 						item_type = payload.get('type')
 						if not isinstance(item_type, str) or not item_type.endswith('_call'):
 							continue
@@ -351,7 +453,7 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 							seen_tool_calls.add(identity)
 							tool_call_count += 1
 						continue
-					if event.get('type') != 'event_msg' or not isinstance(payload, dict) or payload.get('type') != 'token_count':
+					if not need_token_events or event.get('type') != 'event_msg' or not isinstance(payload, dict) or payload.get('type') != 'token_count':
 						continue
 					info = payload.get('info')
 					if not isinstance(info, dict):
@@ -375,16 +477,22 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 						diagnostics['codex_deduplicated_events'] += 1
 						continue
 					seen_requests.add(identity)
-					if active_model is not None:
+					if need_models and active_model is not None:
 						models.add(active_model)
-					for key, value in incremental.items():
-						totals[key] = totals.get(key, 0) + value
+					if need_tokens:
+						for key, value in incremental.items():
+							totals[key] = totals.get(key, 0) + value
 					request_count += 1
-					if timestamp is not None:
+					if need_times and timestamp is not None:
 						first_event = timestamp if first_event is None else min(first_event, timestamp)
 						last_event = timestamp if last_event is None else max(last_event, timestamp)
+					if activity_only:
+						activity_found = True
+						break
 		except OSError as exc:
 			raise CountError(f'cannot read {path}: {exc}') from exc
+		if activity_found:
+			break
 	return (totals, request_count, turn_count, tool_call_count, first_event, last_event, sorted(models, key=str.casefold))
 
 def input_counts(raw: dict[str, int | None]) -> dict[str, int | None]:
@@ -444,11 +552,18 @@ def total_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 	tokens = {'input': {field: sum_token_field(results, 'input', field) for field in ('total', 'cache_read', 'cache_write', 'uncached')}, 'output': {field: sum_token_field(results, 'output', field) for field in ('total', 'reasoning')}, 'total': sum_token_field(results, 'total')}
 	start_values = [parse_datetime(result['start']) for result in results if 'start' in result]
 	end_values = [parse_datetime(result['end']) for result in results if 'end' in result]
+	models: set[str] = set()
+	for result in results:
+		thread_models = result.get('models')
+		if isinstance(thread_models, list):
+			models.update(model for model in thread_models if isinstance(model, str) and model)
 	total: dict[str, Any] = {'thread_count': len(results), 'turn_count': sum_scalar(results, 'turn_count'), 'request_count': sum_scalar(results, 'request_count'), 'tool_call_count': sum_scalar(results, 'tool_call_count')}
 	if start_values:
 		total['start'] = utc_text(min(start_values))
 	if end_values:
 		total['end'] = utc_text(max(end_values))
+	if models:
+		total['models'] = sorted(models, key=str.casefold)
 	total['tokens'] = tokens
 	return total
 
@@ -460,15 +575,17 @@ def nested_value(value: dict[str, Any], *path: str) -> Any:
 		current = current[field]
 	return current
 
+def flatten_models_for_toon(value: dict[str, Any]) -> dict[str, Any]:
+	models = value.get('models')
+	return {**value, 'models': ','.join(models)} if isinstance(models, list) else value
+
 def flatten_thread_for_toon(thread: dict[str, Any], fields: tuple[str, ...] = DETAIL_FIELDS) -> dict[str, Any]:
-	models = nested_value(thread, 'models')
-	if isinstance(models, list):
-		models = ','.join(models)
+	thread = flatten_models_for_toon(thread)
 	values = {
 		'provider': nested_value(thread, 'provider'),
 		'thread_id': nested_value(thread, 'thread_id'),
 		'thread_name': nested_value(thread, 'thread_name'),
-		'models': models,
+		'models': nested_value(thread, 'models'),
 		'turn_count': nested_value(thread, 'turn_count'),
 		'request_count': nested_value(thread, 'request_count'),
 		'tool_call_count': nested_value(thread, 'tool_call_count'),
@@ -484,40 +601,42 @@ def flatten_thread_for_toon(thread: dict[str, Any], fields: tuple[str, ...] = DE
 	}
 	return {field: values[field] for field in fields}
 
-def project_thread_for_json(thread: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+def project_fields(value: dict[str, Any], fields: tuple[str, ...], direct_fields: tuple[str, ...]) -> dict[str, Any]:
 	projected: dict[str, Any] = {}
 	for field in fields:
-		if field in ('provider', 'thread_id', 'thread_name', 'models', 'turn_count', 'request_count', 'tool_call_count', 'start', 'end'):
-			if field in thread:
-				projected[field] = thread[field]
+		if field in direct_fields:
+			if field in value:
+				projected[field] = value[field]
 			continue
-		token_path = {
-			'input': ('input', 'total'),
-			'cache_read': ('input', 'cache_read'),
-			'cache_write': ('input', 'cache_write'),
-			'uncached': ('input', 'uncached'),
-			'output': ('output', 'total'),
-			'reasoning': ('output', 'reasoning'),
-			'tokens': ('total',),
-		}[field]
-		value = nested_value(thread, 'tokens', *token_path)
-		if value == TOON_MISSING:
+		token_path = TOKEN_FIELD_PATHS.get(field)
+		if token_path is None:
+			continue
+		token_value = nested_value(value, 'tokens', *token_path)
+		if token_value == TOON_MISSING:
 			continue
 		tokens = projected.setdefault('tokens', {})
 		if len(token_path) == 1:
-			tokens[token_path[0]] = value
+			tokens[token_path[0]] = token_value
 		else:
-			tokens.setdefault(token_path[0], {})[token_path[1]] = value
+			tokens.setdefault(token_path[0], {})[token_path[1]] = token_value
 	return projected
+
+def project_thread_for_json(thread: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+	return project_fields(thread, fields, THREAD_DIRECT_FIELDS)
+
+def project_total(total: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+	return {'thread_count': total.get('thread_count', 0), **project_fields(total, fields, TOTAL_DIRECT_FIELDS)}
 
 def encode_output_as_toon(output: dict[str, Any], fields: tuple[str, ...] = DETAIL_FIELDS) -> str:
 	try:
 		from toon_format import encode as encode_toon
 	except ImportError as exc:
 		raise CountError('TOON output support is not installed') from exc
-	toon_output = output
+	toon_output = flatten_models_for_toon(output)
 	if isinstance(output.get('threads'), list):
-		toon_output = {**output, 'threads': [flatten_thread_for_toon(thread, fields) for thread in output['threads']]}
+		toon_output = {**toon_output, 'threads': [flatten_thread_for_toon(thread, fields) for thread in output['threads']]}
+	if isinstance(output.get('total'), dict):
+		toon_output = {**toon_output, 'total': flatten_models_for_toon(output['total'])}
 	return encode_toon(toon_output, {'delimiter': '|'}).replace(TOON_MISSING, '')
 
 def parse_fields(raw: str | None) -> tuple[str, ...]:
@@ -538,17 +657,19 @@ def build_parser() -> argparse.ArgumentParser:
 		description=DESCRIPTION,
 		formatter_class=argparse.RawDescriptionHelpFormatter,
 		epilog='\n'.join((
+			'Default output: thread_count only.',
+			'',
 			'Examples:',
-			'  count_tokens.py',
-			'  count_tokens.py codex:all cursor:all --after 2026-07-28T00:00:00Z',
-			'  count_tokens.py codex:<thread_id> --detail --fields all --json',
+			'  local-ai-agent-usage-stats.py',
+			'  local-ai-agent-usage-stats.py codex:all cursor:all --after 2026-07-28T00:00:00Z',
+			'  local-ai-agent-usage-stats.py codex:<thread_id> --detail --fields all --json',
 		)),
 	)
 	parser.add_argument('threads', nargs='*', metavar='PROVIDER:THREAD_ID', help='full ID, unique prefix, or provider:all; defaults to codex:all cursor:all for today')
 	parser.add_argument('--after', type=parse_datetime, metavar='DATETIME', help='include events at or after this ISO 8601 datetime')
 	parser.add_argument('--before', type=parse_datetime, metavar='DATETIME', help='include events before this ISO 8601 datetime')
-	parser.add_argument('--detail', action='store_true', help='include a minimal per-thread array and the full total; see --detail --help')
-	parser.add_argument('--fields', metavar='LIST', help='comma-separated thread fields, or all; requires --detail')
+	parser.add_argument('--detail', action='store_true', help='include a per-thread array and a total with matching fields; see --fields --help')
+	parser.add_argument('--fields', metavar='LIST', help='comma-separated fields for total and, with --detail, threads; or all')
 	parser.add_argument('--json', action='store_true', help='encode output as JSON instead of TOON')
 	return parser
 
@@ -559,25 +680,17 @@ def format_detail_help() -> str:
 		*(f'  {field.ljust(width)}  {DETAIL_FIELD_DESCRIPTIONS[field]}' for field in DETAIL_FIELDS),
 		'',
 		f'Default fields: {", ".join(DEFAULT_DETAIL_FIELDS)}',
+		'The total follows the selected fields and always includes thread_count.',
 		'Unavailable values are blank in TOON and omitted from JSON.',
 		'',
 	]
 	return '\n'.join(lines)
 
-def collapsed_script_path() -> str:
-	script = Path(__file__).resolve()
-	home = Path.home().resolve()
-	try:
-		return str(Path('~') / script.relative_to(home))
-	except ValueError:
-		return str(script)
-
-def command_prefix() -> str:
-	path = collapsed_script_path()
-	return f'python "{path}"' if ' ' in path else f'python {path}'
+def current_time() -> datetime:
+	return datetime.now().astimezone()
 
 def today_window() -> tuple[datetime, datetime]:
-	now = datetime.now().astimezone()
+	now = current_time()
 	start = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
 	return (start.astimezone(timezone.utc), now.astimezone(timezone.utc))
 
@@ -596,6 +709,7 @@ def collect_results(
 	after: datetime | None,
 	before: datetime | None,
 	*,
+	required_fields: frozenset[str] = ALL_COLLECTION_FIELDS,
 	best_effort: bool = False,
 	failures: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -606,17 +720,30 @@ def collect_results(
 		try:
 			if provider == 'codex':
 				codex_home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')).expanduser()
-				codex_threads = discover_codex_threads(codex_home, diagnostics)
+				codex_threads = discover_codex_threads(codex_home, diagnostics, after if select_all else None)
 				if not codex_threads:
-					raise CountError(f'no Codex session JSONL files found under {codex_home}')
-				codex_names = load_codex_names(codex_home, diagnostics)
+					if diagnostics['codex_session_files'] == 0:
+						raise CountError(f'no Codex session JSONL files found under {codex_home}')
+					continue
+				codex_names = load_codex_names(codex_home, diagnostics) if 'thread_name' in required_fields else {}
 				selected = sorted(codex_threads) if select_all else resolve_threads(provider, provider_threads, set(codex_threads))
 				provider_results: list[dict[str, Any]] = []
 				for thread_id in selected:
-					raw, request_count, turn_count, tool_call_count, first_event, last_event, models = parse_codex_usage(codex_threads[thread_id], after, before, diagnostics)
+					raw, request_count, turn_count, tool_call_count, first_event, last_event, models = parse_codex_usage(codex_threads[thread_id], after, before, diagnostics, required_fields, activity_required=select_all)
 					if select_all and request_count == 0:
 						continue
-					provider_results.append(make_result(provider, thread_id, codex_names.get(thread_id), raw, first_event, last_event, turn_count=turn_count, request_count=request_count, tool_call_count=tool_call_count, models=models))
+					provider_results.append(make_result(
+						provider,
+						thread_id,
+						codex_names.get(thread_id),
+						raw,
+						first_event,
+						last_event,
+						turn_count=turn_count if 'turn_count' in required_fields else None,
+						request_count=request_count if 'request_count' in required_fields else None,
+						tool_call_count=tool_call_count if 'tool_call_count' in required_fields else None,
+						models=models,
+					))
 				if select_all:
 					provider_results.sort(key=lambda result: result.get('end') or '', reverse=True)
 				results.extend(provider_results)
@@ -624,16 +751,28 @@ def collect_results(
 			cursor_db_path = default_cursor_state_db()
 			connection = connect_cursor_db(cursor_db_path)
 			try:
-				cursor_threads = discover_cursor_threads(connection, diagnostics)
+				cursor_threads = discover_cursor_threads(connection, diagnostics, after if select_all else None, include_names='thread_name' in required_fields)
 				if not cursor_threads:
-					raise CountError(f'no Cursor threads found in {cursor_db_path}')
+					if not cursor_threads_exist(connection):
+						raise CountError(f'no Cursor threads found in {cursor_db_path}')
+					continue
 				selected = sorted(cursor_threads, key=str.casefold) if select_all else resolve_threads(provider, provider_threads, set(cursor_threads))
 				provider_results = []
 				for thread_id in selected:
-					turn_count, tool_call_count, activity_count = parse_cursor_usage(connection, thread_id, after, before, diagnostics)
+					turn_count, tool_call_count, activity_count = parse_cursor_usage(connection, thread_id, after, before, diagnostics, required_fields, activity_required=select_all)
 					if select_all and activity_count == 0:
 						continue
-					provider_results.append(make_result(provider, thread_id, cursor_threads.get(thread_id), empty_unknown_counts(), None, None, turn_count=turn_count, request_count=None, tool_call_count=tool_call_count))
+					provider_results.append(make_result(
+						provider,
+						thread_id,
+						cursor_threads.get(thread_id),
+						empty_unknown_counts(),
+						None,
+						None,
+						turn_count=turn_count if 'turn_count' in required_fields else None,
+						request_count=None,
+						tool_call_count=tool_call_count if 'tool_call_count' in required_fields else None,
+					))
 				if select_all:
 					provider_results.sort(key=lambda result: ((result.get('thread_name') or '').casefold(), result['thread_id'].casefold()))
 				results.extend(provider_results)
@@ -646,37 +785,88 @@ def collect_results(
 				failures.append({'provider': provider, 'error': str(exc)})
 	return results
 
-def detailed_help() -> list[str]:
-	prefix = command_prefix()
-	return [
-		f'Run `{prefix} <provider>:<thread_id> <provider>:<thread_id>` for a total across selected threads',
-		'Add `--fields all` for activity counts, start/end timestamps, and input, cache, output, reasoning, and total token counts',
+def fields_help(fields_supplied: bool) -> str:
+	available = ', '.join(DETAIL_FIELDS)
+	if fields_supplied:
+		return f'Available detail fields: {available}'
+	return f'Pass a comma-separated list after `--fields`. Available detail fields: {available}'
+
+def unavailable_fields_help(fields: tuple[str, ...], providers: tuple[str, ...]) -> str | None:
+	warnings = []
+	for provider in providers:
+		missing = [field for field in fields if field not in PROVIDER_DETAIL_FIELDS[provider]]
+		if missing:
+			warnings.append(f'{provider.capitalize()} cannot provide selected fields: {", ".join(missing)}')
+	if not warnings:
+		return None
+	return f'{"; ".join(warnings)}. See `--fields --help` for more information'
+
+def detailed_help(fields_supplied: bool, fields: tuple[str, ...], providers: tuple[str, ...]) -> list[str]:
+	help_lines = [
+		'Pass `<provider>:<thread_id> <provider>:<thread_id>` for a total across selected threads',
+		fields_help(fields_supplied),
 	]
+	availability_help = unavailable_fields_help(fields, providers)
+	if availability_help is not None:
+		help_lines.append(availability_help)
+	return help_lines
 
-def time_range_help() -> str:
-	return 'Add `--after <datetime>` and/or `--before <datetime>` to select another time range'
+def time_range_help(after_supplied: bool, before_supplied: bool) -> str | None:
+	if not after_supplied and not before_supplied:
+		return 'Add `--after <datetime>` and/or `--before <datetime>` to select another time range'
+	if not after_supplied:
+		return 'Add `--after <datetime>` to set the range start'
+	if not before_supplied:
+		return 'Add `--before <datetime>` to set the range end'
+	return None
 
-def home_output(results: list[dict[str, Any]], detail: bool, fields: tuple[str, ...], json_mode: bool, failures: list[dict[str, str]], suggest_time_range: bool) -> dict[str, Any]:
-	prefix = command_prefix()
-	output: dict[str, Any] = {
-		'bin': collapsed_script_path(),
-		'description': DESCRIPTION,
-	}
+def missing_thread_help(error: ThreadNotFoundError, after: datetime | None, before: datetime | None, after_supplied: bool, before_supplied: bool) -> str:
+	arguments = [f'{error.provider}:all', '--detail', '--fields', 'provider,thread_id,thread_name']
+	if after_supplied and after is not None:
+		arguments.extend(('--after', utc_text(after)))
+	if before_supplied and before is not None:
+		arguments.extend(('--before', utc_text(before)))
+	return f'Discover available {error.provider.capitalize()} threads with `{" ".join(arguments)}`'
+
+def overview_output(
+	results: list[dict[str, Any]],
+	detail: bool,
+	fields: tuple[str, ...],
+	json_mode: bool,
+	failures: list[dict[str, str]],
+	*,
+	providers: tuple[str, ...],
+	fields_supplied: bool,
+	after_supplied: bool,
+	before_supplied: bool,
+) -> dict[str, Any]:
+	output: dict[str, Any] = {'description': DESCRIPTION}
 	if detail:
 		output['threads'] = [project_thread_for_json(thread, fields) for thread in results] if json_mode else results
-	output['total'] = total_results(results)
+		output['total'] = project_total(total_results(results), fields)
+	elif fields_supplied:
+		output['total'] = project_total(total_results(results), fields)
+	else:
+		output['total'] = {'thread_count': len(results)}
 	if failures:
 		output['unavailable'] = failures
 	if not json_mode:
 		if detail:
-			output['help'] = detailed_help()
+			output['help'] = detailed_help(fields_supplied, fields, providers)
 		else:
 			output['help'] = [
-				f'Run `{prefix} --detail` for per-thread titles and totals',
-				f'Run `{prefix} codex:<thread_id>` for one Codex thread total',
+				'Pass `--detail` for per-thread titles and totals',
+				fields_help(fields_supplied),
 			]
-		if suggest_time_range:
-			output['help'].append(time_range_help())
+			if fields_supplied:
+				availability_help = unavailable_fields_help(fields, providers)
+				if availability_help is not None:
+					output['help'].append(availability_help)
+		range_help = time_range_help(after_supplied, before_supplied)
+		if range_help is not None:
+			output['help'].append(range_help)
+		if not results:
+			output['help'].insert(0, NO_ACTIVITY_HELP)
 	return output
 
 def emit_output(output: dict[str, Any], *, json_mode: bool, fields: tuple[str, ...]) -> None:
@@ -696,14 +886,15 @@ def emit_error(message: str, help_text: str, *, json_mode: bool) -> None:
 		sys.stdout.write(json.dumps(output, ensure_ascii=False))
 
 def valid_flags_help() -> str:
-	return f'Run `{command_prefix()} --help`; valid flags: --after, --before, --detail, --fields, --json, --help'
+	return 'Pass `--help`; valid flags: --after, --before, --detail, --fields, --json, --help'
 
 def main(argv: list[str] | None = None) -> int:
 	arguments = list(sys.argv[1:] if argv is None else argv)
 	json_mode = '--json' in arguments
 	parser = build_parser()
 	if '--help' in arguments or '-h' in arguments:
-		sys.stdout.write(format_detail_help() if '--detail' in arguments else parser.format_help())
+		fields_help_requested = any(argument == '--fields' or argument.startswith('--fields=') for argument in arguments)
+		sys.stdout.write(format_detail_help() if '--detail' in arguments or fields_help_requested else parser.format_help())
 		return 0
 	for removed, replacement in (('--thread-all', 'use codex:all or cursor:all'), ('--thread', 'pass codex:<thread_id> or cursor:<thread_id> positionally')):
 		if any(argument == removed or argument.startswith(f'{removed}=') for argument in arguments):
@@ -713,43 +904,68 @@ def main(argv: list[str] | None = None) -> int:
 		args = parser.parse_args(arguments)
 		if args.after is not None and args.before is not None and args.after >= args.before:
 			raise UsageError('--after must be earlier than --before')
-		if args.fields is not None and not args.detail:
-			raise UsageError('--fields requires --detail')
+		if args.after is not None and args.after >= current_time():
+			raise UsageError('--after must be earlier than now')
 		fields = parse_fields(args.fields)
-		time_range_supplied = args.after is not None or args.before is not None
-		home = not args.threads
+		fields_supplied = args.fields is not None
+		required_fields = frozenset(fields) if args.detail or fields_supplied else frozenset()
+		after_supplied = args.after is not None
+		before_supplied = args.before is not None
+		time_range_supplied = after_supplied or before_supplied
 		if not time_range_supplied:
 			args.after, args.before = today_window()
-		if home:
-			selectors = ['codex:all', 'cursor:all']
-		else:
-			selectors = args.threads
+		selectors = args.threads or list(DEFAULT_SELECTORS)
 		requested = requested_threads(selectors)
+		overview = (
+			set(requested) == {'codex', 'cursor'}
+			and all(len(requested[provider]) == 1 and requested[provider][0].casefold() == 'all' for provider in ('codex', 'cursor'))
+		)
+		if overview:
+			selectors = list(DEFAULT_SELECTORS)
+			requested = {'codex': ['all'], 'cursor': ['all']}
 	except (UsageError, CountError) as exc:
 		emit_error(str(exc), valid_flags_help(), json_mode=json_mode)
 		return 2
 	try:
 		failures: list[dict[str, str]] = []
-		results = collect_results(requested, args.after, args.before, best_effort=home, failures=failures)
-		if home:
-			output = home_output(results, args.detail, fields, args.json, failures, not time_range_supplied)
+		results = collect_results(requested, args.after, args.before, required_fields=required_fields, best_effort=overview, failures=failures)
+		providers = tuple(requested)
+		if overview:
+			output = overview_output(results, args.detail, fields, args.json, failures, providers=providers, fields_supplied=fields_supplied, after_supplied=after_supplied, before_supplied=before_supplied)
 		elif args.detail:
 			output = {
 				'threads': [project_thread_for_json(thread, fields) for thread in results] if args.json else results,
-				'total': total_results(results),
+				'total': project_total(total_results(results), fields),
 			}
 			if not args.json:
-				output['help'] = detailed_help()
-				if not time_range_supplied:
-					output['help'].append(time_range_help())
+				output['help'] = detailed_help(fields_supplied, fields, providers)
+				if not results:
+					output['help'].insert(0, NO_ACTIVITY_HELP)
+				range_help = time_range_help(after_supplied, before_supplied)
+				if range_help is not None:
+					output['help'].append(range_help)
 		else:
-			output = total_results(results)
-			if not args.json and not time_range_supplied:
-				output['help'] = [time_range_help()]
+			output = project_total(total_results(results), fields) if fields_supplied else {'thread_count': len(results)}
+			if not args.json:
+				help_lines = [NO_ACTIVITY_HELP] if not results else []
+				if fields_supplied:
+					availability_help = unavailable_fields_help(fields, providers)
+					if availability_help is not None:
+						help_lines.append(availability_help)
+				range_help = time_range_help(after_supplied, before_supplied)
+				if range_help is not None:
+					help_lines.append(range_help)
+				if help_lines:
+					output['help'] = help_lines[0] if help_lines == [NO_ACTIVITY_HELP] else help_lines
 		emit_output(output, json_mode=args.json, fields=fields)
 		return 0
 	except CountError as exc:
-		help_text = f'Run `{command_prefix()} --json` if TOON output is unavailable' if 'TOON output' in str(exc) else f'Confirm the selected local data exists, then rerun `{command_prefix()} {" ".join(selectors)}`'
+		if isinstance(exc, ThreadNotFoundError):
+			help_text = missing_thread_help(exc, args.after, args.before, after_supplied, before_supplied)
+		elif 'TOON output' in str(exc):
+			help_text = 'Pass `--json` if TOON output is unavailable'
+		else:
+			help_text = f'Confirm the selected local data exists, then rerun with `{" ".join(selectors)}`'
 		emit_error(str(exc), help_text, json_mode=args.json)
 		return 1
 
