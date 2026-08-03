@@ -96,6 +96,23 @@ class CursorUsageTests(unittest.TestCase):
 		counts = COUNT_TOKENS.input_counts({'input_tokens': 10, 'cached_input_tokens': 3, 'cache_write_input_tokens': 2})
 		self.assertEqual(counts, {'total': 10, 'cache_read': 3, 'cache_write': 2, 'uncached': 5})
 
+	def test_codex_models_are_distinct_and_time_filtered(self):
+		with tempfile.TemporaryDirectory() as directory:
+			path = Path(directory) / 'rollout.jsonl'
+			events = [
+				{'timestamp': '2026-07-28T09:59:00Z', 'type': 'turn_context', 'payload': {'turn_id': 'before', 'model': 'gpt-5.6-sol'}},
+				{'timestamp': '2026-07-28T10:01:00Z', 'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {'last_token_usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}}},
+				{'timestamp': '2026-07-28T10:02:00Z', 'type': 'turn_context', 'payload': {'turn_id': 'inside', 'model': 'gpt-5.5'}},
+				{'timestamp': '2026-07-28T11:01:00Z', 'type': 'turn_context', 'payload': {'turn_id': 'after', 'model': 'gpt-5.6-terra'}},
+			]
+			path.write_text('\n'.join(json.dumps(event) for event in events), encoding='utf-8')
+			after = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+			before = datetime(2026, 7, 28, 11, 0, tzinfo=timezone.utc)
+			_, request_count, turn_count, _, _, _, models = COUNT_TOKENS.parse_codex_usage([path], after, before, {})
+		self.assertEqual(request_count, 1)
+		self.assertEqual(turn_count, 1)
+		self.assertEqual(models, ['gpt-5.5', 'gpt-5.6-sol'])
+
 	def test_cursor_all_through_cli_interface(self):
 		output = io.StringIO()
 		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--json', '--detail']), redirect_stdout(output):
@@ -139,7 +156,7 @@ class CursorUsageTests(unittest.TestCase):
 			'    total: 0',
 			'    reasoning: 0',
 			'  total: 0',
-			'help[1]: Add `--after <datetime>` and/or `--before <datetime>` to select another time range',
+			'help[1|]: Add `--after <datetime>` and/or `--before <datetime>` to select another time range',
 		]))
 
 	def test_json_without_detail_returns_total_directly(self):
@@ -158,7 +175,7 @@ class CursorUsageTests(unittest.TestCase):
 		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--detail']), redirect_stdout(output):
 			exit_code = COUNT_TOKENS.main()
 		self.assertEqual(exit_code, 0)
-		self.assertTrue(output.getvalue().startswith('threads[1]{provider,thread_id,thread_name,tokens}:\n  cursor,CaseSensitive-ID,Cursor thread,\ntotal:\n'))
+		self.assertTrue(output.getvalue().startswith('threads[1|]{provider|thread_id|thread_name|models|tokens}:\n  cursor|CaseSensitive-ID|Cursor thread||\ntotal:\n'))
 		self.assertFalse(output.getvalue().endswith('\n'))
 
 	def test_detail_fields_all_returns_full_toon_schema(self):
@@ -166,19 +183,26 @@ class CursorUsageTests(unittest.TestCase):
 		with patch.object(COUNT_TOKENS, 'default_cursor_state_db', return_value=self.database_path), self.default_time_window(), patch.object(sys, 'argv', ['count_tokens.py', 'cursor:all', '--detail', '--fields', 'all']), redirect_stdout(output):
 			exit_code = COUNT_TOKENS.main()
 		self.assertEqual(exit_code, 0)
-		self.assertTrue(output.getvalue().startswith('threads[1]{provider,thread_id,thread_name,turn_count,request_count,tool_call_count,start,end,input,cache_read,cache_write,uncached,output,reasoning,tokens}:\n  cursor,CaseSensitive-ID,Cursor thread,1,,2,,,,,,,,,\ntotal:\n'))
+		self.assertTrue(output.getvalue().startswith('threads[1|]{provider|thread_id|thread_name|models|turn_count|request_count|tool_call_count|start|end|input|cache_read|cache_write|uncached|output|reasoning|tokens}:\n  cursor|CaseSensitive-ID|Cursor thread||1||2|||||||||\ntotal:\n'))
 
 	def test_detail_toon_tabularizes_mixed_thread_schemas(self):
 		event_time = datetime(2026, 7, 28, tzinfo=timezone.utc)
 		codex_tokens = {field: 1 for field in COUNT_TOKENS.STANDARD_FIELDS}
-		codex_result = COUNT_TOKENS.make_result('codex', 'codex-id', None, codex_tokens, event_time, event_time, turn_count=1, request_count=1, tool_call_count=1)
+		codex_result = COUNT_TOKENS.make_result('codex', 'codex-id', None, codex_tokens, event_time, event_time, turn_count=1, request_count=1, tool_call_count=1, models=['gpt-5.5', 'gpt-5.6-sol'])
 		cursor_result = COUNT_TOKENS.make_result('cursor', 'cursor-id', 'Cursor', COUNT_TOKENS.empty_unknown_counts(), None, None, turn_count=2, request_count=None, tool_call_count=3)
 		output = COUNT_TOKENS.encode_output_as_toon({'threads': [codex_result, cursor_result], 'total': COUNT_TOKENS.total_results([codex_result, cursor_result])})
 		lines = output.splitlines()
-		self.assertEqual(lines[0], 'threads[2]{provider,thread_id,thread_name,turn_count,request_count,tool_call_count,start,end,input,cache_read,cache_write,uncached,output,reasoning,tokens}:')
-		self.assertEqual(lines[1], '  codex,codex-id,,1,1,1,"2026-07-28T00:00:00Z","2026-07-28T00:00:00Z",1,1,,0,1,1,1')
-		self.assertEqual(lines[2], '  cursor,cursor-id,Cursor,2,,3,,,,,,,,,')
+		self.assertEqual(lines[0], 'threads[2|]{provider|thread_id|thread_name|models|turn_count|request_count|tool_call_count|start|end|input|cache_read|cache_write|uncached|output|reasoning|tokens}:')
+		self.assertEqual(lines[1], '  codex|codex-id||gpt-5.5,gpt-5.6-sol|1|1|1|"2026-07-28T00:00:00Z"|"2026-07-28T00:00:00Z"|1|1||0|1|1|1')
+		self.assertEqual(lines[2], '  cursor|cursor-id|Cursor||2||3|||||||||')
 		self.assertNotIn(COUNT_TOKENS.TOON_MISSING, output)
+
+	def test_models_are_arrays_in_json_and_scalar_in_toon(self):
+		thread = COUNT_TOKENS.make_result('codex', 'codex-id', None, COUNT_TOKENS.empty_codex_counts(), None, None, turn_count=1, request_count=1, tool_call_count=0, models=['gpt-5.5', 'gpt-5.6-sol'])
+		projected = COUNT_TOKENS.project_thread_for_json(thread, COUNT_TOKENS.DEFAULT_DETAIL_FIELDS)
+		self.assertEqual(projected['models'], ['gpt-5.5', 'gpt-5.6-sol'])
+		toon = COUNT_TOKENS.encode_output_as_toon({'threads': [thread], 'total': COUNT_TOKENS.total_results([thread])}, COUNT_TOKENS.DEFAULT_DETAIL_FIELDS)
+		self.assertIn('threads[1|]{provider|thread_id|thread_name|models|tokens}:\n  codex|codex-id||gpt-5.5,gpt-5.6-sol|0', toon)
 
 	def test_json_fields_projects_nested_tokens(self):
 		output = io.StringIO()
@@ -197,7 +221,7 @@ class CursorUsageTests(unittest.TestCase):
 		self.assertIn('bin:', output.getvalue())
 		self.assertIn("today's activity is the default", output.getvalue())
 		self.assertIn('thread_count: 0', output.getvalue())
-		self.assertIn('help[3]:', output.getvalue())
+		self.assertIn('help[3|]:', output.getvalue())
 		self.assertIn('--after <datetime>', output.getvalue())
 		self.assertIn('--before <datetime>', output.getvalue())
 
@@ -238,7 +262,7 @@ class CursorUsageTests(unittest.TestCase):
 			self.assertIn(f'  {field}', output.getvalue())
 			self.assertIn(COUNT_TOKENS.DETAIL_FIELD_DESCRIPTIONS[field], output.getvalue())
 			self.assertTrue(COUNT_TOKENS.DETAIL_FIELD_DESCRIPTIONS[field].endswith(('Providers: Codex.', 'Providers: Codex, Cursor.')))
-		self.assertIn('Default fields: provider, thread_id, thread_name, tokens', output.getvalue())
+		self.assertIn('Default fields: provider, thread_id, thread_name, models, tokens', output.getvalue())
 		self.assertIn('Unavailable values are blank in TOON and omitted from JSON.', output.getvalue())
 		self.assertIn('max(0, input - cache_read - cache_write)', output.getvalue())
 		self.assertIn('reported directly rather than computed from input and output', output.getvalue())

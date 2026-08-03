@@ -24,6 +24,7 @@ DETAIL_FIELDS = (
 	'provider',
 	'thread_id',
 	'thread_name',
+	'models',
 	'turn_count',
 	'request_count',
 	'tool_call_count',
@@ -37,11 +38,12 @@ DETAIL_FIELDS = (
 	'reasoning',
 	'tokens',
 )
-DEFAULT_DETAIL_FIELDS = ('provider', 'thread_id', 'thread_name', 'tokens')
+DEFAULT_DETAIL_FIELDS = ('provider', 'thread_id', 'thread_name', 'models', 'tokens')
 DETAIL_FIELD_DESCRIPTIONS = {
 	'provider': 'Data source for the row. Providers: Codex, Cursor.',
 	'thread_id': 'Provider-local thread identifier. Providers: Codex, Cursor.',
 	'thread_name': 'Thread title when recorded locally. Providers: Codex, Cursor.',
+	'models': 'Distinct effective models recorded in the selected range. Providers: Codex.',
 	'turn_count': 'Number of user turns. Providers: Codex, Cursor.',
 	'request_count': 'Number of model requests with recorded token usage. Providers: Codex.',
 	'tool_call_count': 'Number of unique tool calls. Providers: Codex, Cursor.',
@@ -296,7 +298,7 @@ def usage_delta(current: dict[str, int], previous: dict[str, int]) -> dict[str, 
 		delta[key] = value - prior if value >= prior else value
 	return delta
 
-def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetime | None, diagnostics: dict[str, int]) -> tuple[dict[str, int], int, int, int, datetime | None, datetime | None]:
+def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetime | None, diagnostics: dict[str, int]) -> tuple[dict[str, int], int, int, int, datetime | None, datetime | None, list[str]]:
 	totals = empty_codex_counts()
 	request_count = 0
 	turn_count = 0
@@ -306,8 +308,10 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 	seen_requests: set[str] = set()
 	seen_turns: set[str] = set()
 	seen_tool_calls: set[str] = set()
+	models: set[str] = set()
 	for path in paths:
 		previous_total: dict[str, int] = {}
+		active_model: str | None = None
 		try:
 			with path.open('r', encoding='utf-8') as stream:
 				for line in stream:
@@ -318,9 +322,14 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 						continue
 					payload = event.get('payload')
 					if event.get('type') == 'turn_context' and isinstance(payload, dict):
+						model = payload.get('model')
+						if isinstance(model, str) and model:
+							active_model = model
 						included, _ = event_in_window(event, after, before, diagnostics, 'codex_turns_without_usable_timestamp')
 						if not included:
 							continue
+						if active_model is not None:
+							models.add(active_model)
 						turn_id = payload.get('turn_id')
 						identity = f'turn:{turn_id}' if isinstance(turn_id, str) and turn_id else json.dumps([event.get('timestamp'), payload], sort_keys=True, separators=(',', ':'))
 						if identity not in seen_turns:
@@ -366,6 +375,8 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 						diagnostics['codex_deduplicated_events'] += 1
 						continue
 					seen_requests.add(identity)
+					if active_model is not None:
+						models.add(active_model)
 					for key, value in incremental.items():
 						totals[key] = totals.get(key, 0) + value
 					request_count += 1
@@ -374,7 +385,7 @@ def parse_codex_usage(paths: list[Path], after: datetime | None, before: datetim
 						last_event = timestamp if last_event is None else max(last_event, timestamp)
 		except OSError as exc:
 			raise CountError(f'cannot read {path}: {exc}') from exc
-	return (totals, request_count, turn_count, tool_call_count, first_event, last_event)
+	return (totals, request_count, turn_count, tool_call_count, first_event, last_event, sorted(models, key=str.casefold))
 
 def input_counts(raw: dict[str, int | None]) -> dict[str, int | None]:
 	read_source = next((field for field in READ_FIELDS if isinstance(raw.get(field), int)), None)
@@ -399,8 +410,10 @@ def make_tokens(raw: dict[str, int | None]) -> dict[str, Any]:
 		tokens['total'] = raw['total_tokens']
 	return tokens
 
-def make_result(provider: str, thread_id: str, thread_name: str | None, raw: dict[str, int | None], first_event: datetime | None, last_event: datetime | None, turn_count: int | None, request_count: int | None, tool_call_count: int | None) -> dict[str, Any]:
+def make_result(provider: str, thread_id: str, thread_name: str | None, raw: dict[str, int | None], first_event: datetime | None, last_event: datetime | None, turn_count: int | None, request_count: int | None, tool_call_count: int | None, models: list[str] | None = None) -> dict[str, Any]:
 	result: dict[str, Any] = {'provider': provider, 'thread_id': thread_id, 'thread_name': thread_name, 'turn_count': turn_count, 'request_count': request_count, 'tool_call_count': tool_call_count, 'start': utc_text(first_event), 'end': utc_text(last_event)}
+	if models:
+		result['models'] = models
 	tokens = make_tokens(raw)
 	if tokens:
 		result['tokens'] = tokens
@@ -448,10 +461,14 @@ def nested_value(value: dict[str, Any], *path: str) -> Any:
 	return current
 
 def flatten_thread_for_toon(thread: dict[str, Any], fields: tuple[str, ...] = DETAIL_FIELDS) -> dict[str, Any]:
+	models = nested_value(thread, 'models')
+	if isinstance(models, list):
+		models = ','.join(models)
 	values = {
 		'provider': nested_value(thread, 'provider'),
 		'thread_id': nested_value(thread, 'thread_id'),
 		'thread_name': nested_value(thread, 'thread_name'),
+		'models': models,
 		'turn_count': nested_value(thread, 'turn_count'),
 		'request_count': nested_value(thread, 'request_count'),
 		'tool_call_count': nested_value(thread, 'tool_call_count'),
@@ -470,7 +487,7 @@ def flatten_thread_for_toon(thread: dict[str, Any], fields: tuple[str, ...] = DE
 def project_thread_for_json(thread: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
 	projected: dict[str, Any] = {}
 	for field in fields:
-		if field in ('provider', 'thread_id', 'thread_name', 'turn_count', 'request_count', 'tool_call_count', 'start', 'end'):
+		if field in ('provider', 'thread_id', 'thread_name', 'models', 'turn_count', 'request_count', 'tool_call_count', 'start', 'end'):
 			if field in thread:
 				projected[field] = thread[field]
 			continue
@@ -501,7 +518,7 @@ def encode_output_as_toon(output: dict[str, Any], fields: tuple[str, ...] = DETA
 	toon_output = output
 	if isinstance(output.get('threads'), list):
 		toon_output = {**output, 'threads': [flatten_thread_for_toon(thread, fields) for thread in output['threads']]}
-	return encode_toon(toon_output).replace(TOON_MISSING, '')
+	return encode_toon(toon_output, {'delimiter': '|'}).replace(TOON_MISSING, '')
 
 def parse_fields(raw: str | None) -> tuple[str, ...]:
 	if raw is None:
@@ -596,10 +613,10 @@ def collect_results(
 				selected = sorted(codex_threads) if select_all else resolve_threads(provider, provider_threads, set(codex_threads))
 				provider_results: list[dict[str, Any]] = []
 				for thread_id in selected:
-					raw, request_count, turn_count, tool_call_count, first_event, last_event = parse_codex_usage(codex_threads[thread_id], after, before, diagnostics)
+					raw, request_count, turn_count, tool_call_count, first_event, last_event, models = parse_codex_usage(codex_threads[thread_id], after, before, diagnostics)
 					if select_all and request_count == 0:
 						continue
-					provider_results.append(make_result(provider, thread_id, codex_names.get(thread_id), raw, first_event, last_event, turn_count=turn_count, request_count=request_count, tool_call_count=tool_call_count))
+					provider_results.append(make_result(provider, thread_id, codex_names.get(thread_id), raw, first_event, last_event, turn_count=turn_count, request_count=request_count, tool_call_count=tool_call_count, models=models))
 				if select_all:
 					provider_results.sort(key=lambda result: result.get('end') or '', reverse=True)
 				results.extend(provider_results)

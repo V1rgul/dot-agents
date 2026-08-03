@@ -9,7 +9,10 @@ The script reads Codex JSONL sessions from `$CODEX_HOME`, defaulting to `~/.code
 - Name each thread's first and last recorded token timestamps `start` and `end`. Set total `start` to the earliest available start and total `end` to the latest available end; omit either key when no corresponding timestamp is available.
 - For numeric total fields, ignore per-thread `null` or absent values, aggregate available values, and return `0` when none are available.
 - Count a Codex turn from each unique `turn_context`, a request from each token-bearing `token_count` event, and a tool call from each unique response item whose type ends in `_call`.
+- Report distinct Codex effective models from `turn_context.payload.model` as `models` in detailed thread output. Apply the selected time range and carry the latest preceding turn model forward to token events in that range. Omit the field when no model is recorded.
+- Preserve `models` as an array in JSON. Join it with commas only in the flattened TOON projection and encode TOON arrays with the pipe delimiter so thread rows remain tabular without quoting multi-model cells.
 - For Cursor, count human bubbles as turns and unique local tool-call IDs as tool calls. Omit requests, token-event metadata, all token categories, and all token-derived categories because Cursor's local database does not record usable values for them.
+- Do not report Cursor `composerData.modelConfig` as model usage: it is mutable composer configuration, while local bubble records do not retain per-request model history.
 - Use the compact token schema `tokens.input.{total,cache_read,cache_write,uncached}`, `tokens.output.{total,reasoning}`, and `tokens.total`. Calculate `input.uncached` as `max(0, input.total - input.cache_read - input.cache_write)`, treating an unavailable cache-write count as zero.
 - Treat cache-read input as cached input. Treat reasoning output as a subset of output, not an additional amount to add to total tokens.
 - Treat a zero-thread result as a successful, definitive empty state with `thread_count: 0` and zero-valued totals.
