@@ -466,6 +466,20 @@ class CursorUsageTests(unittest.TestCase):
 		self.assertIn('Default output: thread_count only.', output.getvalue())
 		self.assertIn('see --fields --help', output.getvalue())
 
+	def test_missing_python_dependency_hints_requirements_install(self):
+		with patch.dict(sys.modules, {'toon_format': None}):
+			with self.assertRaises(COUNT_TOKENS.CountError) as context:
+				COUNT_TOKENS.encode_output_as_toon({'thread_count': 0})
+		self.assertEqual(str(context.exception), 'Missing Python dependency: toon_format')
+		output = io.StringIO()
+		with self.default_time_window(), patch.object(COUNT_TOKENS, 'collect_results', return_value=[]), patch.dict(sys.modules, {'toon_format': None}), redirect_stdout(output):
+			exit_code = COUNT_TOKENS.main([])
+		result = json.loads(output.getvalue())
+		self.assertEqual(exit_code, 1)
+		self.assertEqual(result['error'], 'Missing Python dependency: toon_format')
+		self.assertEqual(result['help'], COUNT_TOKENS.MISSING_DEPENDENCY_HELP)
+		self.assertIn('pip install -r "<skill-dir>/requirements.txt"', result['help'])
+
 	def test_unknown_fields_are_structured_on_stdout(self):
 		output = io.StringIO()
 		with redirect_stdout(output):

@@ -21,6 +21,7 @@ THREAD_ID_RE = re.compile('([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 TOON_MISSING = '__TOKENS_COUNT_MISSING_8F0B3C57__'
 DESCRIPTION = "Count Codex tokens and Codex/Cursor activity from local data; today's activity is the default."
 NO_ACTIVITY_HELP = 'No recorded activity matches the selected time range; adjust `--after` or `--before`'
+MISSING_DEPENDENCY_HELP = 'Install dependencies with `pip install -r "<skill-dir>/requirements.txt"`'
 DETAIL_FIELDS = (
 	'provider',
 	'thread_id',
@@ -631,7 +632,8 @@ def encode_output_as_toon(output: dict[str, Any], fields: tuple[str, ...] = DETA
 	try:
 		from toon_format import encode as encode_toon
 	except ImportError as exc:
-		raise CountError('TOON output support is not installed') from exc
+		missing = getattr(exc, 'name', None) or 'required package'
+		raise CountError(f'Missing Python dependency: {missing}') from exc
 	toon_output = flatten_models_for_toon(output)
 	if isinstance(output.get('threads'), list):
 		toon_output = {**toon_output, 'threads': [flatten_thread_for_toon(thread, fields) for thread in output['threads']]}
@@ -962,8 +964,8 @@ def main(argv: list[str] | None = None) -> int:
 	except CountError as exc:
 		if isinstance(exc, ThreadNotFoundError):
 			help_text = missing_thread_help(exc, args.after, args.before, after_supplied, before_supplied)
-		elif 'TOON output' in str(exc):
-			help_text = 'Pass `--json` if TOON output is unavailable'
+		elif str(exc).startswith('Missing Python dependency:'):
+			help_text = MISSING_DEPENDENCY_HELP
 		else:
 			help_text = f'Confirm the selected local data exists, then rerun with `{" ".join(selectors)}`'
 		emit_error(str(exc), help_text, json_mode=args.json)
